@@ -32,8 +32,11 @@ std::tuple<Tensor, Tensor, Tensor> cudnn_batch_norm(
   // axis
   setCuDNNStreamToCurrent();
 
+  // axis = -1: ishape = 2, istride
+  // axis = 1, normal
+
   cudnnBatchNormMode_t mode;
-  if (input->dim() == 2) {
+  if (ishape.size() == 2) {
     mode = CUDNN_BATCHNORM_PER_ACTIVATION;
   } else {
     mode = CUDNN_BATCHNORM_SPATIAL;
