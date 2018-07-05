@@ -29,9 +29,9 @@ inline cudnnDataType_t getDataType(const at::Tensor& t) {
 } // anonymous namespace
 
 
-void TensorDescriptor::set(const at::Tensor &t, size_t pad) {
-  set(getDataType(t), t.sizes(), t.strides(), pad);
-}
+//void TensorDescriptor::set(const at::Tensor &t, size_t pad) {
+//  set(getDataType(t), t.sizes(), t.strides(), pad);
+//}
 
 void TensorDescriptor::set(cudnnDataType_t datatype, IntList t_sizes, IntList t_strides, size_t pad) {
   size_t dim = t_sizes.size();
@@ -106,8 +106,34 @@ std::ostream& operator<<(std::ostream & out, const TensorDescriptor& d) {
 
 void TensorDescriptor::print() { std::cout << *this; }
 
-void FilterDescriptor::set(const at::Tensor &t, int64_t pad) {
-  auto dim = t.ndimension();
+//void FilterDescriptor::set(const at::Tensor &t, int64_t pad, int axis) {
+//  auto dim = t.ndimension();
+//  if (dim > CUDNN_DIM_MAX || pad > CUDNN_DIM_MAX)
+//#define _STR(X) #X
+//#define STR(X) _STR(X)
+//    throw std::runtime_error("cuDNN supports only up to " STR(CUDNN_DIM_MAX) " dimensions");
+//#undef _STR
+//#undef STR
+//  if (!t.is_contiguous()) {
+//    // NB: It is possible for this test to be insufficient, because the
+//    // Tensor passed in to set the filter descriptor may not be the actual
+//    // Tensor whose data pointer is passed to cuDNN.  Nevertheless,
+//    // that is the common case, so we can catch most client errors with this test.
+//    throw std::runtime_error("cuDNN filters (a.k.a. weights) must be contiguous");
+//  }
+//  int size[CUDNN_DIM_MAX];
+//  for (int i = 0; i < dim; ++i) {
+//    size[i] = (int) t.size(i);
+//  }
+//  for (int i = dim; i < pad; ++i) {
+//    size[i] = (int) 1;
+//  }
+//  dim = std::max(dim, pad);
+//  set(getDataType(t), (int) dim, size, axis);
+//}
+
+void FilterDescriptor::set(cudnnDataType_t dataType, IntList sizes, int64_t pad, int axis) {
+  auto dim = sizes.size();
   if (dim > CUDNN_DIM_MAX || pad > CUDNN_DIM_MAX)
 #define _STR(X) #X
 #define STR(X) _STR(X)
@@ -123,13 +149,13 @@ void FilterDescriptor::set(const at::Tensor &t, int64_t pad) {
   }
   int size[CUDNN_DIM_MAX];
   for (int i = 0; i < dim; ++i) {
-    size[i] = (int) t.size(i);
+    size[i] = (int) sizes(i);
   }
   for (int i = dim; i < pad; ++i) {
     size[i] = (int) 1;
   }
   dim = std::max(dim, pad);
-  set(getDataType(t), (int) dim, size);
+  set(dataType, (int) dim, size, axis);
 }
 
 }}

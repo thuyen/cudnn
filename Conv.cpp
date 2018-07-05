@@ -107,7 +107,7 @@ namespace at { namespace native {
 constexpr int input_batch_size_dim = 0;  // also grad_input
 constexpr int input_channels_dim = 1;
 constexpr int output_batch_size_dim = 0;  // also grad_output
-constexpr int output_channels_dim = 1;
+//constexpr int output_channels_dim = 1; now 1 or -1
 constexpr int weight_output_channels_dim = 0;
 constexpr int weight_input_channels_dim = 1;
 
@@ -273,19 +273,18 @@ struct ConvolutionParams
 // grad_input/grad_output, so this is not very pressing)
 void setConvolutionParams(
     ConvolutionParams* params,
-    const at::Tensor& input, const at::Tensor& weight,
+    cudnnDataType_t dataType,
     IntList padding, IntList stride, IntList dilation,
     int64_t groups, bool deterministic) {
 
-  cudnnDataType_t dataType = getCudnnDataType(input);
   memset(params, 0, sizeof(ConvolutionParams));
   params->dataType = dataType;
-  // ASSERT(weight.dim() == input.dim())
-  for (int i = 0; i != input.dim(); ++i) {
-    params->input_size[i] = (int) input.size(i);
-    params->input_stride[i] = (int) input.stride(i);
-    params->weight_size[i] = (int) weight.size(i);
-  }
+  //// ASSERT(weight.dim() == input.dim())
+  //for (int i = 0; i != input.dim(); ++i) {
+  //  params->input_size[i] = (int) input.size(i);
+  //  params->input_stride[i] = (int) input.stride(i);
+  //  params->weight_size[i] = (int) weight.size(i);
+  //}
   // ASSERT(padding.size() == stride.size())
   // ASSERT(padding.size() == dilation.size())
   for (size_t i = 0; i != padding.size(); ++i) {
@@ -306,10 +305,12 @@ struct ConvolutionArgs {
   ConvolutionParams params;
   TensorDescriptor idesc, odesc;
   FilterDescriptor wdesc;
-  const Tensor& input, output, weight;
+  //const Tensor& input, output, weight;
+  const void *input, *output, *weight;
   ConvolutionDescriptor cdesc;
 
-  ConvolutionArgs(const Tensor& input, const Tensor& output, const Tensor& weight) : input(input), output(output), weight(weight) {
+  //ConvolutionArgs(const Tensor& input, const Tensor& output, const Tensor& weight) : input(input), output(output), weight(weight) {
+  ConvolutionArgs(const void *input, const void *output, const void *weight) : input(input), output(output), weight(weight) {
   }
 };
 
@@ -480,10 +481,10 @@ struct algorithm_search<cudnnConvolutionFwdAlgo_t> {
     Workspace ws(max_ws_size);
     AT_CUDNN_CHECK(cudnnFindConvolutionForwardAlgorithmEx(
         args.handle,
-        args.idesc.desc(), args.input.data_ptr(),
-        args.wdesc.desc(), args.weight.data_ptr(),
+        args.idesc.desc(), args.input,
+        args.wdesc.desc(), args.weight,
         args.cdesc.desc(),
-        args.odesc.desc(), args.output.data_ptr(),
+        args.odesc.desc(), args.output,
         num_algos,
         &perf_count,
         perf_results.get(),
@@ -549,10 +550,10 @@ struct algorithm_search<cudnnConvolutionBwdDataAlgo_t> {
     Workspace ws(max_ws_size);
     AT_CUDNN_CHECK(cudnnFindConvolutionBackwardDataAlgorithmEx(
         args.handle,
-        args.wdesc.desc(), args.weight.data_ptr(),
-        args.odesc.desc(), args.output.data_ptr(),
+        args.wdesc.desc(), args.weight,
+        args.odesc.desc(), args.output,
         args.cdesc.desc(),
-        args.idesc.desc(), args.input.data_ptr(),
+        args.idesc.desc(), args.input,
         num_algos,
         &perf_count,
         perf_results.get(),
@@ -619,10 +620,10 @@ struct algorithm_search<cudnnConvolutionBwdFilterAlgo_t> {
 
     AT_CUDNN_CHECK(cudnnFindConvolutionBackwardFilterAlgorithmEx(
         args.handle,
-        args.idesc.desc(), args.input.data_ptr(),
-        args.odesc.desc(), args.output.data_ptr(),
+        args.idesc.desc(), args.input,
+        args.odesc.desc(), args.output,
         args.cdesc.desc(),
-        args.wdesc.desc(), args.weight.data_ptr(),
+        args.wdesc.desc(), args.weight,
         num_algos,
         &perf_count,
         perf_results.get(),
@@ -732,24 +733,27 @@ Workspace chooseAlgorithm(
 // ---------------------------------------------------------------------
 
 // In-place!
-void cudnn_convolution_add_bias_(CheckedFrom c, const TensorArg& output, const TensorArg& bias)
+void raw_cudnn_convolution_add_bias_(
+    cudnnDataType_t dataType,
+    void *output, const void *bias,
+    IntList oshape, IntList bshape,
+    IntList ostride, IntList bstride)
 {
-  checkAllSameType(c, {output, bias});
-  checkAllSameGPU(c, {output, bias});
-  checkSize(c, bias, { output->size(output_channels_dim) });
+  // bshape = 1s
+  // bshape[axis] = oshape[axis]
 
   // See Note [CuDNN broadcast padding].  Handle the left padding
   // ourselves, but use TensorDescriptor's padding argument to do the rest.
   TensorDescriptor bdesc, odesc;
-  bdesc.set(bias->expand({1, bias->size(0)}), output->dim());
-  odesc.set(*output);
+
+  bdesc.set(dataType, bshape, bstride);
+  odesc.set(dataType, oshape, ostride);
 
   auto handle = getCudnnHandle();
-  auto dataType = getCudnnDataType(*bias);
   Constant one(dataType, 1);
 
-  AT_CUDNN_CHECK(cudnnAddTensor(handle, &one, bdesc.desc(), bias->data_ptr(),
-                                     &one, odesc.desc(), output->data_ptr()));
+  AT_CUDNN_CHECK(cudnnAddTensor(handle, &one, bdesc.desc(), bias,
+                                     &one, odesc.desc(), output));
 }
 
 // The general strategy:
@@ -794,20 +798,29 @@ void cudnn_convolution_add_bias_(CheckedFrom c, const TensorArg& output, const T
 //    - It doesn't resize output (it is assumed to be correctly sized)
 //    - It takes a ConvolutionParams struct
 //
+
 void raw_cudnn_convolution_forward_out(
-    const Tensor& output, const Tensor& input, const Tensor& weight,
+    cudnnDataType_t dataType,
+    void* output, const void* input, const void* weight,
+    IntList oshape, IntList ishape, IntList wshape,
+    IntList istride, IntList ostride,
     IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic) {
+    int axis, bool benchmark, bool deterministic) {
 
-  auto dataType = getCudnnDataType(input);
+//void raw_cudnn_convolution_forward_out(
+//    const Tensor& output, const Tensor& input, const Tensor& weight,
+//    IntList padding, IntList stride, IntList dilation, int64_t groups,
+//    bool benchmark, bool deterministic) {
 
-  ConvolutionArgs args{ input, output, weight };
+  ConvolutionArgs args{ input, output, weight }; //can pass pointer
   args.handle = getCudnnHandle();
-  setConvolutionParams(&args.params, input, weight, padding, stride, dilation, groups, deterministic);
-  args.idesc.set(input);
-  args.wdesc.set(weight);
-  args.odesc.set(output);
-  args.cdesc.set(dataType, input.dim() - 2, args.params.padding, args.params.stride, args.params.dilation, args.params.groups);
+
+  // needs input, actually we don't need input/weight stride/shape for params!
+  setConvolutionParams(&args.params, dataType, padding, stride, dilation, groups, deterministic);
+  args.idesc.set(dataType, ishape, istride);
+  args.wdesc.set(dataType, wshape, axis);
+  args.odesc.set(dataType, oshape, ostride);
+  args.cdesc.set(dataType, wshape.size() - 2, args.params.padding, args.params.stride, args.params.dilation, args.params.groups);
 
   // TODO: when we do legacy group convolution support, we'll repeatedly
   // reinitialize the workspace for each convolution we do.  This is
@@ -822,102 +835,12 @@ void raw_cudnn_convolution_forward_out(
 
   AT_CUDNN_CHECK(cudnnConvolutionForward(
     args.handle,
-    &one, args.idesc.desc(), input.data_ptr(),
-    args.wdesc.desc(), weight.data_ptr(),
+    &one, args.idesc.desc(), input,
+    args.wdesc.desc(), weight,
     args.cdesc.desc(), fwdAlg, workspace.data, workspace.size,
-    &zero, args.odesc.desc(), output.data_ptr()));
+    &zero, args.odesc.desc(), output));
 }
 
-Tensor cudnn_convolution_forward(
-    CheckedFrom c,
-    const TensorArg& input, const TensorArg& weight,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic)
-{
-  checkAllSameType(c, {input, weight});
-  checkAllSameGPU(c, {input, weight});
-
-  auto output_t = input->type().tensor(
-                    conv_output_size(input->sizes(), weight->sizes(),
-                                     padding, stride, dilation, groups));
-
-  // Avoid ambiguity of "output" when this is being used as backwards
-  TensorArg output{ output_t, "result", 0 };
-  convolution_shape_check(c, input, weight, output, padding, stride, dilation, groups);
-
-  // See #4500
-  Tensor weight_contig = weight->contiguous();
-
-#if CUDNN_VERSION < 7000
-  for (int i = 0; i < groups; i++) {
-    raw_cudnn_convolution_forward_out(
-        narrowGroup(*output, output_channels_dim,        i, groups),
-        narrowGroup(*input,  input_channels_dim,         i, groups),
-        narrowGroup(weight_contig, weight_output_channels_dim, i, groups),
-        padding, stride, dilation, 1, benchmark, deterministic);
-  }
-#else
-  raw_cudnn_convolution_forward_out(
-      *output, *input, weight_contig,
-      padding, stride, dilation, groups, benchmark, deterministic);
-#endif
-
-  return *output;
-}
-
-Tensor cudnn_convolution(
-    const Tensor& input_t, const Tensor& weight_t, const Tensor& bias_t,
-    IntList padding, IntList stride, IntList dilation,
-    int64_t groups, bool benchmark, bool deterministic)
-{
-  TensorArg input  { input_t,  "input",  1 },
-            weight { weight_t, "weight", 2 },
-            bias   { bias_t,   "bias",   3 };
-  setCuDNNStreamToCurrent();
-  CheckedFrom c = "cudnn_convolution";
-  auto output_t = cudnn_convolution_forward(
-    c, input, weight, padding, stride, dilation, groups, benchmark, deterministic);
-  if (bias->defined()) {
-    cudnn_convolution_add_bias_(c, { output_t, "result", 0 }, bias);
-  }
-  return output_t;
-}
-
-// NB: output_padding not needed here, as there is no ambiguity to
-// resolve
-Tensor cudnn_convolution_transpose_backward_input(
-    const Tensor& grad_output_t, const Tensor& weight_t,
-    IntList padding, IntList stride, IntList dilation,
-    int64_t groups, bool benchmark, bool deterministic)
-{
-  TensorArg grad_output { grad_output_t,  "grad_output", 1 },
-            weight      { weight_t, "weight", 2 };
-  setCuDNNStreamToCurrent();
-  return cudnn_convolution_forward(
-    "cudnn_convolution_transpose_backward_input",
-    grad_output, weight, padding, stride, dilation, groups, benchmark, deterministic);
-}
-
-std::tuple<at::Tensor,at::Tensor,at::Tensor> cudnn_convolution_transpose_backward(
-    const at::Tensor& input, const at::Tensor& grad_output_t, const at::Tensor& weight,
-    IntList padding, IntList output_padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic, std::array<bool,3> output_mask) {
-
-  Tensor grad_output = grad_output_t.contiguous();
-
-  Tensor grad_input, grad_weight, grad_bias;
-  if (output_mask[0]) {
-    grad_input = at::cudnn_convolution_transpose_backward_input(grad_output, weight, padding, stride, dilation, groups, benchmark, deterministic);
-  }
-  if (output_mask[1]) {
-    grad_weight = at::cudnn_convolution_transpose_backward_weight(weight.sizes(), grad_output, input, padding, stride, dilation, groups, benchmark, deterministic);
-  }
-  if (output_mask[2]) {
-    grad_bias = at::cudnn_convolution_backward_bias(grad_output);
-  }
-
-  return std::tuple<Tensor,Tensor,Tensor>{grad_input, grad_weight, grad_bias};
-}
 
 // ---------------------------------------------------------------------
 //
@@ -925,22 +848,22 @@ std::tuple<at::Tensor,at::Tensor,at::Tensor> cudnn_convolution_transpose_backwar
 //
 // ---------------------------------------------------------------------
 
-void raw_cudnn_convolution_backward_input_out(
-    const at::Tensor& grad_input,
-    const at::Tensor& grad_output,
-    const at::Tensor& weight,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic) {
 
-  auto dataType = getCudnnDataType(grad_output);
+void raw_cudnn_convolution_backward_input_out(
+    cudnnDataType_t dataType,
+    void* grad_input, const void* grad_output, const void* weight,
+    IntList ishape, IntList oshape, IntList wshape,
+    IntList istride, IntList ostride,
+    IntList padding, IntList stride, IntList dilation, int64_t groups,
+    int axis, bool benchmark, bool deterministic) {
 
   ConvolutionArgs args{ grad_input, grad_output, weight };
   args.handle = getCudnnHandle();
-  setConvolutionParams(&args.params, grad_input, weight, padding, stride, dilation, groups, deterministic);
-  args.idesc.set(grad_input);
-  args.wdesc.set(weight);
-  args.odesc.set(grad_output);
-  args.cdesc.set(dataType, grad_output.dim() - 2, args.params.padding, args.params.stride, args.params.dilation, args.params.groups);
+  setConvolutionParams(&args.params, dataType, padding, stride, dilation, groups, deterministic);
+  args.idesc.set(dataType, ishape, istride);
+  args.wdesc.set(dataType, wshape, 0, axis);
+  args.odesc.set(dataType, oshape, ostride);
+  args.cdesc.set(dataType, wshape.size() - 2, args.params.padding, args.params.stride, args.params.dilation, args.params.groups);
 
   cudnnConvolutionBwdDataAlgo_t bwdDataAlg;
   Workspace workspace = chooseAlgorithm(args, benchmark, &bwdDataAlg);
@@ -950,10 +873,10 @@ void raw_cudnn_convolution_backward_input_out(
 
   AT_CUDNN_CHECK(cudnnConvolutionBackwardData(
       args.handle,
-      &one, args.wdesc.desc(), weight.data_ptr(),
-      args.odesc.desc(), grad_output.data_ptr(),
+      &one, args.wdesc.desc(), weight,
+      args.odesc.desc(), grad_output,
       args.cdesc.desc(), bwdDataAlg, workspace.data, workspace.size,
-      &zero, args.idesc.desc(), grad_input.data_ptr()));
+      &zero, args.idesc.desc(), grad_input));
 }
 
 // Backward and transpose are algorithmically equivalent, but they
@@ -966,104 +889,8 @@ void raw_cudnn_convolution_backward_input_out(
 // output_padding parameter.  Both of these interfaces are equivalent,
 // but they are differently convenient depending on the use case.
 
-Tensor cudnn_convolution_backward_input(
-    CheckedFrom c,
-    IntList input_size, const TensorArg& grad_output, const TensorArg& weight,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic)
-{
-  checkAllSameType(c, {grad_output, weight});
-  checkAllSameGPU(c, {grad_output, weight});
 
-  auto grad_input_t = grad_output->type().tensor(input_size);
 
-  // Avoid "grad_input" when this is being used as transposed convolution
-  TensorArg grad_input{ grad_input_t, "result", 0 };
-  convolution_shape_check(c, grad_input, weight, grad_output, padding, stride, dilation, groups);
-
-  // See #4500
-  Tensor weight_contig = weight->contiguous();
-
-#if CUDNN_VERSION < 7000
-  for (int i = 0; i < groups; i++) {
-    raw_cudnn_convolution_backward_input_out(
-        narrowGroup(*grad_input, input_channels_dim, i, groups),
-        narrowGroup(*grad_output, output_channels_dim, i, groups),
-        narrowGroup(weight_contig, weight_output_channels_dim, i, groups),
-        padding, stride, dilation, 1, benchmark, deterministic);
-  }
-#else
-  raw_cudnn_convolution_backward_input_out(
-      *grad_input, *grad_output, weight_contig,
-      padding, stride, dilation, groups, benchmark, deterministic);
-#endif
-
-  return *grad_input;
-}
-
-Tensor cudnn_convolution_transpose_forward(
-    CheckedFrom c,
-    const TensorArg& grad_output, const TensorArg& weight,
-    IntList padding, IntList output_padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic)
-{
-  auto input_size = conv_input_size(grad_output->sizes(), weight->sizes(),
-                                    padding, output_padding, stride, dilation, groups);
-  return cudnn_convolution_backward_input(c, input_size, grad_output, weight,
-                                    padding, stride, dilation, groups, benchmark, deterministic);
-}
-
-Tensor cudnn_convolution_backward_input(
-    IntList input_size, const Tensor& grad_output_t, const Tensor& weight_t,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic)
-{
-  TensorArg grad_output{ grad_output_t, "grad_output", 1 },
-            weight{ weight_t, "weight", 2 };
-  setCuDNNStreamToCurrent();
-  return cudnn_convolution_backward_input(
-      "cudnn_convolution_backward_input",
-      input_size, grad_output, weight,
-      padding, stride, dilation, groups, benchmark, deterministic);
-}
-
-std::tuple<at::Tensor,at::Tensor,at::Tensor> cudnn_convolution_backward(
-    const at::Tensor& input, const at::Tensor& grad_output_t, const at::Tensor& weight,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic, std::array<bool,3> output_mask) {
-
-  Tensor grad_output = grad_output_t.contiguous();
-
-  Tensor grad_input, grad_weight, grad_bias;
-  if (output_mask[0]) {
-    grad_input = at::cudnn_convolution_backward_input(input.sizes(), grad_output, weight, padding, stride, dilation, groups, benchmark, deterministic);
-  }
-  if (output_mask[1]) {
-    grad_weight = at::cudnn_convolution_backward_weight(weight.sizes(), grad_output, input, padding, stride, dilation, groups, benchmark, deterministic);
-  }
-  if (output_mask[2]) {
-    grad_bias = at::cudnn_convolution_backward_bias(grad_output);
-  }
-
-  return std::tuple<Tensor,Tensor,Tensor>{grad_input, grad_weight, grad_bias};
-}
-
-Tensor cudnn_convolution_transpose(
-    const Tensor& input_t, const Tensor& weight_t, const Tensor& bias_t,
-    IntList padding, IntList output_padding, IntList stride, IntList dilation,
-    int64_t groups, bool benchmark, bool deterministic)
-{
-  TensorArg input  { input_t,  "input",  1 },
-            weight { weight_t, "weight", 2 },
-            bias   { bias_t,   "bias",   3 };
-  CheckedFrom c = "cudnn_convolution_transpose";
-  auto output_t = cudnn_convolution_transpose_forward(
-    c, input, weight, padding, output_padding, stride, dilation, groups, benchmark, deterministic);
-  if (bias->defined()) {
-    cudnn_convolution_add_bias_(c, { output_t, "result", 0 }, bias);
-  }
-  return output_t;
-}
 
 // ---------------------------------------------------------------------
 //
@@ -1072,19 +899,20 @@ Tensor cudnn_convolution_transpose(
 // ---------------------------------------------------------------------
 
 void raw_cudnn_convolution_backward_weight_out(
-    const Tensor& grad_weight, const Tensor& grad_output, const Tensor& input,
+    cudnnDataType_t dataType,
+    void *grad_weight, const void *grad_output, const void *input,
+    IntList ishape, IntList oshape, IntList wshape,
+    IntList istride, IntList ostride,
     IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic) {
-
-  auto dataType = getCudnnDataType(input);
+    int axis, bool benchmark, bool deterministic) {
 
   ConvolutionArgs args{ input, grad_output, grad_weight };
   args.handle = getCudnnHandle();
-  setConvolutionParams(&args.params, input, grad_weight, padding, stride, dilation, groups, deterministic);
-  args.idesc.set(input);
-  args.wdesc.set(grad_weight);
-  args.odesc.set(grad_output);
-  args.cdesc.set(dataType, input.dim() - 2, args.params.padding, args.params.stride, args.params.dilation, args.params.groups);
+  setConvolutionParams(&args.params, dataType, padding, stride, dilation, groups, deterministic);
+  args.idesc.set(dataType, ishape, istride);
+  args.wdesc.set(dataType, wshape, 0, axis);
+  args.odesc.set(dataType, oshape, ostride);
+  args.cdesc.set(dataType, wshape.size() - 2, args.params.padding, args.params.stride, args.params.dilation, args.params.groups);
 
   cudnnConvolutionBwdFilterAlgo_t bwdFilterAlg;
   Workspace workspace = chooseAlgorithm(args, benchmark, &bwdFilterAlg);
@@ -1094,77 +922,12 @@ void raw_cudnn_convolution_backward_weight_out(
 
   AT_CUDNN_CHECK(cudnnConvolutionBackwardFilter(
       args.handle,
-      &one, args.idesc.desc(), input.data_ptr(),
-      args.odesc.desc(), grad_output.data_ptr(),
+      &one, args.idesc.desc(), input,
+      args.odesc.desc(), grad_output,
       args.cdesc.desc(), bwdFilterAlg, workspace.data, workspace.size,
-      &zero, args.wdesc.desc(), grad_weight.data_ptr()));
+      &zero, args.wdesc.desc(), grad_weight));
 }
 
-Tensor cudnn_convolution_backward_weight(
-    CheckedFrom c,
-    IntList weight_size, const TensorArg& grad_output, const TensorArg& input,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic)
-{
-
-  checkAllSameType(c, {grad_output, input});
-  checkAllSameGPU(c, {grad_output, input});
-
-  auto grad_weight_t = grad_output->type().tensor(weight_size);
-
-  // For uniformity with everything else, although it seems grad_weight
-  // would be unambiguous too.
-  TensorArg grad_weight{ grad_weight_t, "result", 0 };
-  convolution_shape_check(c, input, grad_weight, grad_output, padding, stride, dilation, groups);
-
-#if CUDNN_VERSION < 7000
-  for (int i = 0; i < groups; i++) {
-    raw_cudnn_convolution_backward_weight_out(
-        narrowGroup(*grad_weight, weight_output_channels_dim, i, groups),
-        narrowGroup(*grad_output, output_channels_dim, i, groups),
-        narrowGroup(*input, input_channels_dim, i, groups),
-        padding, stride, dilation, groups, benchmark, deterministic);
-  }
-#else
-  raw_cudnn_convolution_backward_weight_out(
-      *grad_weight, *grad_output, *input,
-      padding, stride, dilation, groups, benchmark, deterministic);
-#endif
-
-  return grad_weight_t;
-}
-
-Tensor cudnn_convolution_backward_weight(
-    IntList weight_size,
-    const Tensor& grad_output_t,
-    const Tensor& input_t,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic)
-{
-  TensorArg grad_output{ grad_output_t, "grad_output", 1 },
-            input{ input_t, "input", 2 };
-  setCuDNNStreamToCurrent();
-  return cudnn_convolution_backward_weight(
-      "cudnn_convolution_backward_weight",
-      weight_size, grad_output, input,
-      padding, stride, dilation, groups, benchmark, deterministic);
-}
-
-Tensor cudnn_convolution_transpose_backward_weight(
-    IntList weight_size,
-    const Tensor& grad_output_t,
-    const Tensor& input_t,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic)
-{
-  TensorArg grad_output{ grad_output_t, "grad_output", 1 },
-            input{ input_t, "input", 2 };
-  setCuDNNStreamToCurrent();
-  return cudnn_convolution_backward_weight(
-      "cudnn_convolution_backward_weight",
-      weight_size, input, grad_output,
-      padding, stride, dilation, groups, benchmark, deterministic);
-}
 
 // ---------------------------------------------------------------------
 //
@@ -1172,31 +935,27 @@ Tensor cudnn_convolution_transpose_backward_weight(
 //
 // ---------------------------------------------------------------------
 
-Tensor cudnn_convolution_backward_bias(
-    const Tensor& grad_output_t)
+
+void raw_cudnn_convolution_backward_bias(
+    cudnnDataType_t dataType,
+    void *grad_bias, const void *grad_output,
+    IntList oshape, IntList bshape,
+    IntList ostride, IntList bstride)
 {
-  TensorArg grad_output{ grad_output_t, "grad_output", 1 };
   setCuDNNStreamToCurrent();
-
-  auto grad_bias_t = grad_output->type().tensor(
-                        { grad_output->size(output_channels_dim) });
-
-  TensorArg grad_bias{ grad_bias_t, "result", 0 };
 
   // See Note [CuDNN broadcast padding].  Handle the left padding
   // ourselves, but use TensorDescriptor's pad argument to do the rest.
-  TensorDescriptor bdesc{grad_bias->expand({1, grad_bias->size(0)}),
-                         static_cast<size_t>(grad_output->dim())};
-  TensorDescriptor odesc{*grad_output};
+  TensorDescriptor bdesc, odesc;
+  bdesc.set(dataType, bshape, bstride);
+  odesc.set(dataType, oshape, ostride);
 
   auto handle = getCudnnHandle();
-  auto dataType = getCudnnDataType(*grad_bias);
   Constant one(dataType, 1);
   Constant zero(dataType, 0);
 
-  AT_CUDNN_CHECK(cudnnConvolutionBackwardBias(handle, &one, odesc.desc(), grad_output->data_ptr(),
-                                                   &zero, bdesc.desc(), grad_bias->data_ptr()));
-  return *grad_bias;
+  AT_CUDNN_CHECK(cudnnConvolutionBackwardBias(handle, &one, odesc.desc(), grad_output,
+                                                   &zero, bdesc.desc(), grad_bias));
 }
 
 
