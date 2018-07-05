@@ -179,10 +179,8 @@ public:
 
 private:
   void set(cudnnDataType_t dataType, int dim, int* size, int axis) {
-    if (axis == 1)
-      AT_CUDNN_CHECK(cudnnSetFilterNdDescriptor(mut_desc(), dataType, CUDNN_TENSOR_NCHW, dim, size));
-    if (axis == -1)
-      AT_CUDNN_CHECK(cudnnSetFilterNdDescriptor(mut_desc(), dataType, CUDNN_TENSOR_NHWC, dim, size));
+    auto format = (axis == 1) ? CUDNN_TENSOR_NCHW : CUDNN_TENSOR_NHWC;
+    AT_CUDNN_CHECK(cudnnSetFilterNdDescriptor(mut_desc(), dataType, format, dim, size));
   }
 };
 
