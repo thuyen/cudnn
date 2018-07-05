@@ -817,7 +817,6 @@ void raw_cudnn_convolution_backward_bias(
                                                    &zero, bdesc.desc(), grad_bias));
 }
 
-
 }}  // namespace
 
 #endif
