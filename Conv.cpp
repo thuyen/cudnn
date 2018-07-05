@@ -3,76 +3,6 @@
 #include <ATen/Config.h>
 #include <ATen/cuda/CUDAConfig.h>
 
-#if !AT_CUDNN_ENABLED()
-
-namespace at { namespace native {
-
-// See Note [ATen preprocessor philosophy]
-
-at::Tensor cudnn_convolution(
-    const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias /* optional */,
-    IntList padding, IntList stride, IntList dilation,
-    int64_t groups, bool benchmark, bool deterministic) {
-  throw std::runtime_error("cudnn_convolution: ATen not compiled with cuDNN support");
-}
-
-at::Tensor cudnn_convolution_backward_input(
-    IntList input_size, const at::Tensor& grad_output, const at::Tensor& weight,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic) {
-  throw std::runtime_error("cudnn_convolution_backward_input: ATen not compiled with cuDNN support");
-}
-
-at::Tensor cudnn_convolution_backward_weight(
-    IntList weight_size, const at::Tensor& grad_output, const at::Tensor& input,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic) {
-  throw std::runtime_error("cudnn_convolution_backward_weight: ATen not compiled with cuDNN support");
-}
-
-at::Tensor cudnn_convolution_backward_bias(
-    const at::Tensor& grad_output) {
-  throw std::runtime_error("cudnn_convolution_backward_bias: ATen not compiled with cuDNN support");
-}
-
-std::tuple<at::Tensor,at::Tensor,at::Tensor> cudnn_convolution_backward(
-    const at::Tensor& input, const at::Tensor& grad_output, const at::Tensor& weight,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic, std::array<bool,3> output_mask) {
-  throw std::runtime_error("cudnn_convolution_backward: ATen not compiled with cuDNN support");
-}
-
-at::Tensor cudnn_convolution_transpose(
-    const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias /* optional */,
-    IntList padding, IntList output_padding, IntList stride, IntList dilation,
-    int64_t groups, bool benchmark, bool deterministic) {
-  throw std::runtime_error("cudnn_convolution_transpose: ATen not compiled with cuDNN support");
-}
-
-at::Tensor cudnn_convolution_transpose_backward_input(
-    const at::Tensor& grad_output, const at::Tensor& weight,
-    IntList padding, IntList stride, IntList dilation,
-    int64_t groups, bool benchmark, bool deterministic) {
-  throw std::runtime_error("cudnn_convolution_transpose_backward: ATen not compiled with cuDNN support");
-}
-
-at::Tensor cudnn_convolution_transpose_backward_weight(
-    IntList weight_size, const at::Tensor& grad_output, const at::Tensor& input,
-    IntList padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic) {
-  throw std::runtime_error("cudnn_convolution_transpose_backward_weight: ATen not compiled with cuDNN support");
-}
-
-std::tuple<at::Tensor,at::Tensor,at::Tensor> cudnn_convolution_transpose_backward(
-    const at::Tensor& input, const at::Tensor& grad_output, const at::Tensor& weight,
-    IntList padding, IntList output_padding, IntList stride, IntList dilation, int64_t groups,
-    bool benchmark, bool deterministic, std::array<bool,3> output_mask) {
-  throw std::runtime_error("cudnn_convolution_transpose_backward: ATen not compiled with cuDNN support");
-}
-
-}}
-
-#else  // AT_CUDNN_ENABLED
 
 #include "THC/THC.h"
 
@@ -105,9 +35,7 @@ namespace at { namespace native {
 // ---------------------------------------------------------------------
 
 constexpr int input_batch_size_dim = 0;  // also grad_input
-constexpr int input_channels_dim = 1;
 constexpr int output_batch_size_dim = 0;  // also grad_output
-//constexpr int output_channels_dim = 1; now 1 or -1
 constexpr int weight_output_channels_dim = 0;
 constexpr int weight_input_channels_dim = 1;
 
@@ -118,63 +46,6 @@ constexpr int max_dim = 3;
 // as conv_output_size loses information; this is why conv_input_size
 // takes an extra output_padding argument to resolve the ambiguity.
 
-std::vector<int64_t> conv_output_size(
-    IntList input_size, IntList weight_size,
-    IntList padding, IntList stride, IntList dilation, int64_t groups
-) {
-  // ASSERT(input_size.size() > 2)
-  // ASSERT(input_size.size() == weight_size.size())
-  auto dim = input_size.size();
-  std::vector<int64_t> output_size(dim);
-  output_size[0] = input_size[input_batch_size_dim];
-  output_size[1] = weight_size[weight_output_channels_dim];
-  for (size_t d = 2; d < dim; ++d) {
-    auto kernel = dilation[d - 2] * (weight_size[d] - 1) + 1;
-    output_size[d] = (input_size[d] + (2 * padding[d - 2])
-                        - kernel) / stride[d - 2] + 1;
-  }
-  return output_size;
-}
-
-std::vector<int64_t> conv_input_size(
-    IntList output_size, IntList weight_size,
-    IntList padding, IntList output_padding, IntList stride, IntList dilation, int64_t groups
-) {
-  // ASSERT(output_size.size() > 2)
-  // ASSERT(output_size.size() == weight_size.size())
-  auto dim = output_size.size();
-  std::vector<int64_t> input_size(dim);
-  input_size[0] = output_size[output_batch_size_dim];
-  input_size[1] = weight_size[weight_input_channels_dim] * groups;
-  for (size_t d = 2; d < dim; ++d) {
-    int kernel = dilation[d - 2] * (weight_size[d] - 1) + 1;
-    input_size[d] = (output_size[d] - 1) * stride[d - 2] - (2 * padding[d - 2]) +
-                     kernel + output_padding[d - 2];
-  }
-  return input_size;
-}
-
-std::vector<int64_t> conv_weight_size(
-    IntList input_size, IntList output_size,
-    IntList padding, IntList output_padding, IntList stride, IntList dilation, int64_t groups
-) {
-  auto dim = input_size.size();
-  std::vector<int64_t> weight_size(dim);
-  weight_size[0] = output_size[1];
-  weight_size[1] = input_size[1] / groups;
-  for (size_t d = 2; d < dim; ++d) {
-    int kernel = input_size[d] - (output_size[d] - 1) * stride[d - 2]
-               + 2 * padding[d - 2] - output_padding[d - 2];
-    weight_size[d] = (kernel - 1) / dilation[d - 2] + 1;
-  }
-  return weight_size;
-}
-
-// TODO: Move this into the standard library, with a better name?
-Tensor narrowGroup(const Tensor& t, int dim, int group_idx, int64_t groups) {
-  auto group_size = t.size(dim) / groups;
-  return t.narrow(dim, group_idx * group_size, group_size);
-}
 
 // ---------------------------------------------------------------------
 //
@@ -254,9 +125,9 @@ static void convolution_shape_check(
 struct ConvolutionParams
 {
   cudnnDataType_t dataType;
-  int input_size[2 + max_dim];
-  int input_stride[2 + max_dim];
-  int weight_size[2 + max_dim];
+  //int input_size[2 + max_dim];
+  //int input_stride[2 + max_dim];
+  //int weight_size[2 + max_dim];
   int padding[max_dim];
   int stride[max_dim];
   int dilation[max_dim];
@@ -878,18 +749,6 @@ void raw_cudnn_convolution_backward_input_out(
       args.cdesc.desc(), bwdDataAlg, workspace.data, workspace.size,
       &zero, args.idesc.desc(), grad_input));
 }
-
-// Backward and transpose are algorithmically equivalent, but they
-// compute their geometry differently.  In a backwards, you knew what
-// the original size of the input tensor was, so you can cache that
-// geometry and fill it directly.  In transposed convolution, it is
-// more conventional to not explicitly specify the output (previously
-// input) size, and compute it.  This, however, leaves a degree of
-// freedom; this degree of freedom is resolved using the
-// output_padding parameter.  Both of these interfaces are equivalent,
-// but they are differently convenient depending on the use case.
-
-
 
 
 // ---------------------------------------------------------------------
