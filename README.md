@@ -1,1 +1,1 @@
-## A generic C++ API for CUDNN
+## A generic C++ API for CUDNN (WIP)
